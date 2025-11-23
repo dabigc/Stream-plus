@@ -17,6 +17,169 @@ from stream_sorter_models import (
 
 
 @dataclass
+class GlobalExclusionPattern:
+    """
+    Global regex pattern for excluding streams across all rules
+
+    Attributes:
+        id: Unique pattern ID
+        name: Descriptive name (e.g., "Backup Streams", "Test Streams")
+        pattern: Regex pattern to match against stream names
+        enabled: Whether this pattern is active
+    """
+    id: int
+    name: str
+    pattern: str
+    enabled: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Converts pattern to dictionary"""
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> 'GlobalExclusionPattern':
+        """Creates a pattern from a dictionary"""
+        return GlobalExclusionPattern(**data)
+
+
+@dataclass
+class GlobalRuleSettings:
+    """
+    Global settings for auto-assignment rules
+
+    Attributes:
+        exclusion_patterns: List of global exclusion patterns
+    """
+    exclusion_patterns: List[GlobalExclusionPattern] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Converts settings to dictionary"""
+        return {
+            'exclusion_patterns': [p.to_dict() for p in self.exclusion_patterns]
+        }
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> 'GlobalRuleSettings':
+        """Creates settings from a dictionary"""
+        patterns = [
+            GlobalExclusionPattern.from_dict(p)
+            for p in data.get('exclusion_patterns', [])
+        ]
+        return GlobalRuleSettings(exclusion_patterns=patterns)
+
+
+class GlobalSettingsManager:
+    """Manager for global rule settings persistence"""
+
+    def __init__(self, settings_file: str = 'global_rule_settings.json'):
+        self.settings_file = settings_file
+        self._ensure_file_exists()
+
+    def _ensure_file_exists(self):
+        """Creates the settings file if it doesn't exist"""
+        # Ensure directory exists
+        directory = os.path.dirname(self.settings_file)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+
+        if not os.path.exists(self.settings_file):
+            # Create with empty settings
+            empty_settings = GlobalRuleSettings()
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(empty_settings.to_dict(), f, indent=2)
+
+    def load_settings(self) -> GlobalRuleSettings:
+        """Loads global settings from the file"""
+        try:
+            with open(self.settings_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return GlobalRuleSettings.from_dict(data)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return GlobalRuleSettings()
+
+    def save_settings(self, settings: GlobalRuleSettings):
+        """Saves global settings to the file"""
+        # Ensure directory exists
+        directory = os.path.dirname(self.settings_file)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+
+        with open(self.settings_file, 'w', encoding='utf-8') as f:
+            json.dump(settings.to_dict(), f, indent=2, ensure_ascii=False)
+
+    def get_pattern(self, pattern_id: int) -> Optional[GlobalExclusionPattern]:
+        """Gets an exclusion pattern by its ID"""
+        settings = self.load_settings()
+        for pattern in settings.exclusion_patterns:
+            if pattern.id == pattern_id:
+                return pattern
+        return None
+
+    def add_pattern(self, name: str, pattern_regex: str, enabled: bool = True) -> GlobalExclusionPattern:
+        """Adds a new exclusion pattern"""
+        settings = self.load_settings()
+
+        # Assign new ID
+        if settings.exclusion_patterns:
+            new_id = max(p.id for p in settings.exclusion_patterns) + 1
+        else:
+            new_id = 1
+
+        new_pattern = GlobalExclusionPattern(
+            id=new_id,
+            name=name,
+            pattern=pattern_regex,
+            enabled=enabled
+        )
+
+        settings.exclusion_patterns.append(new_pattern)
+        self.save_settings(settings)
+        return new_pattern
+
+    def update_pattern(self, pattern_id: int, name: Optional[str] = None,
+                      pattern_regex: Optional[str] = None,
+                      enabled: Optional[bool] = None) -> Optional[GlobalExclusionPattern]:
+        """Updates an existing exclusion pattern"""
+        settings = self.load_settings()
+
+        for i, pattern in enumerate(settings.exclusion_patterns):
+            if pattern.id == pattern_id:
+                if name is not None:
+                    pattern.name = name
+                if pattern_regex is not None:
+                    pattern.pattern = pattern_regex
+                if enabled is not None:
+                    pattern.enabled = enabled
+
+                settings.exclusion_patterns[i] = pattern
+                self.save_settings(settings)
+                return pattern
+
+        return None
+
+    def delete_pattern(self, pattern_id: int) -> bool:
+        """Deletes an exclusion pattern"""
+        settings = self.load_settings()
+        initial_count = len(settings.exclusion_patterns)
+        settings.exclusion_patterns = [
+            p for p in settings.exclusion_patterns if p.id != pattern_id
+        ]
+
+        if len(settings.exclusion_patterns) < initial_count:
+            self.save_settings(settings)
+            return True
+
+        return False
+
+    def get_next_id(self) -> int:
+        """Gets the next available pattern ID"""
+        settings = self.load_settings()
+        if settings.exclusion_patterns:
+            return max(p.id for p in settings.exclusion_patterns) + 1
+        return 1
+
+
+@dataclass
 class AutoAssignmentRule:
     """
     Automatic stream to channel assignment rule
@@ -81,7 +244,10 @@ class AutoAssignmentRule:
     # Manual stream inclusion/exclusion
     force_include_stream_ids: List[int] = field(default_factory=list)  # Streams to include even if they don't match criteria
     force_exclude_stream_ids: List[int] = field(default_factory=list)  # Streams to exclude even if they match criteria
-    
+
+    # Global exclusion pattern overrides
+    override_global_exclusions: List[int] = field(default_factory=list)  # Global exclusion pattern IDs to ignore for this rule
+
     def to_dict(self) -> Dict[str, Any]:
         """Converts rule to dictionary"""
         return asdict(self)
@@ -127,6 +293,11 @@ class RulesManager:
     
     def _ensure_file_exists(self):
         """Creates the rules file if it doesn't exist"""
+        # Ensure directory exists
+        directory = os.path.dirname(self.rules_file)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+
         if not os.path.exists(self.rules_file):
             with open(self.rules_file, 'w', encoding='utf-8') as f:
                 json.dump([], f)
@@ -378,14 +549,17 @@ class StreamMatcher:
         return False
     
     @staticmethod
-    def evaluate_rule(rule: AutoAssignmentRule, streams: List[Dict[str, Any]], failed_test_stream_ids: Optional[set] = None) -> List[Dict[str, Any]]:
+    def evaluate_rule(rule: AutoAssignmentRule, streams: List[Dict[str, Any]],
+                     failed_test_stream_ids: Optional[set] = None,
+                     global_settings: Optional[GlobalRuleSettings] = None) -> List[Dict[str, Any]]:
         """
         Evaluates a rule against a list of streams and returns matching ones
-        
+
         Args:
             rule: Auto-assignment rule
             streams: List of streams (dictionaries with stream data)
             failed_test_stream_ids: Set of stream IDs that failed testing (should be excluded if rule requires stats)
+            global_settings: Global settings with exclusion patterns (optional)
         
         Returns:
             List of streams that meet ALL rule conditions, plus forced inclusions, minus forced exclusions
@@ -425,7 +599,7 @@ class StreamMatcher:
                 continue
             
             # For remaining streams, check if they match the rule conditions
-            if StreamMatcher._stream_matches_rule(rule, stream):
+            if StreamMatcher._stream_matches_rule(rule, stream, global_settings):
                 matching_streams.append(stream)
         
         return matching_streams
@@ -452,34 +626,65 @@ class StreamMatcher:
         return matching_streams
     
     @staticmethod
-    def _stream_matches_basic_conditions(rule: AutoAssignmentRule, stream: Dict[str, Any]) -> bool:
+    def _stream_matches_basic_conditions(rule: AutoAssignmentRule, stream: Dict[str, Any],
+                                        global_settings: Optional[GlobalRuleSettings] = None) -> bool:
         """
         Verifies if a stream meets basic conditions that don't require stats
-        (regex pattern, m3u_account_id)
+        (global exclusions, regex pattern, m3u_account_id)
+
+        Args:
+            rule: Auto-assignment rule to evaluate
+            stream: Stream dictionary to check
+            global_settings: Global settings with exclusion patterns (optional)
+
+        Returns:
+            True if stream passes all basic conditions, False otherwise
         """
+        stream_name = stream.get('name', '')
+
+        # 0. Apply global exclusion patterns FIRST (before rule-specific regex)
+        if global_settings:
+            for pattern in global_settings.exclusion_patterns:
+                # Skip disabled patterns
+                if not pattern.enabled:
+                    continue
+
+                # Skip if this rule explicitly overrides this pattern
+                if pattern.id in rule.override_global_exclusions:
+                    continue
+
+                # Apply global exclusion
+                try:
+                    if re.search(pattern.pattern, stream_name, re.IGNORECASE):
+                        # Stream matches global exclusion pattern - exclude it
+                        return False
+                except re.error:
+                    # Invalid regex in global pattern, skip it
+                    pass
+
         # 1. Filter by regex in name
         if rule.regex_pattern:
-            stream_name = stream.get('name', '')
             try:
                 if not re.search(rule.regex_pattern, stream_name, re.IGNORECASE):
                     return False
             except re.error:
                 # If regex is invalid, no match
                 return False
-        
+
         # 2. Filter by M3U account
         if rule.m3u_account_ids is not None and len(rule.m3u_account_ids) > 0:
             if stream.get('m3u_account') not in rule.m3u_account_ids:
                 return False
-        
+
         return True
     
     @staticmethod
-    def _stream_matches_rule(rule: AutoAssignmentRule, stream: Dict[str, Any]) -> bool:
+    def _stream_matches_rule(rule: AutoAssignmentRule, stream: Dict[str, Any],
+                            global_settings: Optional[GlobalRuleSettings] = None) -> bool:
         """Verifies if a stream meets all rule conditions"""
-        
-        # First check basic conditions
-        if not StreamMatcher._stream_matches_basic_conditions(rule, stream):
+
+        # First check basic conditions (including global exclusions)
+        if not StreamMatcher._stream_matches_basic_conditions(rule, stream, global_settings):
             return False
         
         # Check if rule requires stream statistics
@@ -558,13 +763,21 @@ class StreamMatcher:
         return True
     
     @staticmethod
-    def preview_matches(rule: AutoAssignmentRule, streams: List[Dict[str, Any]], m3u_accounts_dict: Optional[Dict[int, str]] = None) -> Dict[str, Any]:
+    def preview_matches(rule: AutoAssignmentRule, streams: List[Dict[str, Any]],
+                       m3u_accounts_dict: Optional[Dict[int, str]] = None,
+                       global_settings: Optional[GlobalRuleSettings] = None) -> Dict[str, Any]:
         """
         Previews which streams would match the rule with detailed filtering information
-        
+
         For preview purposes, shows ALL streams that match the regex pattern regardless of M3U account filter.
         This allows users to see potential matches across all M3U sources.
-        
+
+        Args:
+            rule: Auto-assignment rule to preview
+            streams: List of all streams
+            m3u_accounts_dict: Optional mapping of M3U account IDs to names
+            global_settings: Optional global settings with exclusion patterns
+
         Returns:
             Dictionary with detailed matching information:
             {
@@ -582,6 +795,33 @@ class StreamMatcher:
         regex_matching = []
         for stream in streams:
             stream_name = stream.get('name', '')
+
+            # FIRST: Apply global exclusions if present
+            if global_settings:
+                excluded_by_global = False
+                for pattern in global_settings.exclusion_patterns:
+                    # Skip disabled patterns
+                    if not pattern.enabled:
+                        continue
+
+                    # Skip if this rule explicitly overrides this pattern
+                    if pattern.id in rule.override_global_exclusions:
+                        continue
+
+                    # Apply global exclusion
+                    try:
+                        if re.search(pattern.pattern, stream_name, re.IGNORECASE):
+                            # Stream matches global exclusion pattern - exclude it
+                            excluded_by_global = True
+                            break
+                    except re.error:
+                        # Invalid regex in global pattern, skip it
+                        pass
+
+                if excluded_by_global:
+                    continue  # Skip this stream due to global exclusion
+
+            # THEN: Check rule's own regex pattern
             try:
                 if rule.regex_pattern and re.search(rule.regex_pattern, stream_name, re.IGNORECASE):
                     # Add M3U source information to the stream
@@ -600,9 +840,9 @@ class StreamMatcher:
             except re.error:
                 # If regex is invalid, skip this stream
                 continue
-        
-        # Then, get streams that pass ALL conditions (including M3U account filter)
-        fully_matching = StreamMatcher.evaluate_rule(rule, streams)
+
+        # Then, get streams that pass ALL conditions (including M3U account filter AND global exclusions)
+        fully_matching = StreamMatcher.evaluate_rule(rule, streams, global_settings=global_settings)
         
         # Categorize the regex matching streams
         partially_matching = []

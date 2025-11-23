@@ -22,7 +22,7 @@ from stream_sorter_models import SortingRulesManager, StreamSorter, SortingRule
 from api.dispatcharr_client import DispatcharrClient
 
 # M3U refresh state file
-M3U_REFRESH_STATE_FILE = 'm3u_refresh_state.json'
+M3U_REFRESH_STATE_FILE = 'rules/m3u_refresh_state.json'
 
 def load_m3u_refresh_state():
     """Load M3U refresh state from file"""
@@ -37,6 +37,11 @@ def load_m3u_refresh_state():
 def save_m3u_refresh_state(state):
     """Save M3U refresh state to file"""
     try:
+        # Ensure directory exists
+        directory = os.path.dirname(M3U_REFRESH_STATE_FILE)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+
         with open(M3U_REFRESH_STATE_FILE, 'w') as f:
             json.dump(state, f, indent=2)
     except Exception as e:
@@ -61,8 +66,12 @@ class RuleExecutor:
             username=os.getenv('DISPATCHARR_API_USER'),
             password=os.getenv('DISPATCHARR_API_PASSWORD')
         )
-        self.assignment_manager = RulesManager()
-        self.sorting_manager = SortingRulesManager(dispatcharr_client=self.dispatcharr_client)
+        self.assignment_manager = RulesManager(rules_file='rules/auto_assignment_rules.json')
+        self.sorting_manager = SortingRulesManager(
+            rules_file='rules/sorting_rules.json',
+            groups_file='rules/channel_groups.json',
+            dispatcharr_client=self.dispatcharr_client
+        )
         
     def execute_assignment_rules(self, rule_ids: Optional[List[int]] = None, verbose: bool = False) -> dict:
         """

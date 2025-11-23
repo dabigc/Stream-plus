@@ -5,11 +5,13 @@ let currentM3UAccounts = [];
 let currentRuleId = null;
 let currentStreams = [];
 let streamSelectorMode = null; // 'include' or 'exclude'
+let globalPatterns = []; // Global exclusion patterns
 
 // Load initial data
 document.addEventListener('DOMContentLoaded', function() {
     loadChannels();
     loadM3UAccounts();
+    loadGlobalPatterns();
 });
 
 // Load channels for dropdown
@@ -207,11 +209,14 @@ function showCreateRuleModal() {
     
     // Load profiles
     loadProfiles();
-    
+
+    // Load global exclusion overrides
+    loadGlobalExclusionOverrides();
+
     // Setup event listeners for modal
     setupModalEventListeners();
     toggleRetestOptions();
-    
+
     const modal = new bootstrap.Modal(document.getElementById('ruleModal'));
     modal.show();
 }
@@ -302,11 +307,24 @@ async function editRule(ruleId) {
                 });
             }
         });
-        
+
+        // Load global exclusion overrides and set selected ones
+        loadGlobalExclusionOverrides();
+        setTimeout(() => {
+            if (rule.override_global_exclusions) {
+                rule.override_global_exclusions.forEach(patternId => {
+                    const checkbox = document.getElementById(`override_${patternId}`);
+                    if (checkbox) {
+                        checkbox.checked = true;
+                    }
+                });
+            }
+        }, 100); // Small delay to ensure checkboxes are rendered
+
         // Setup event listeners for modal
         setupModalEventListeners();
         toggleRetestOptions();
-        
+
         const modal = new bootstrap.Modal(document.getElementById('ruleModal'));
         modal.show();
     } catch (error) {
@@ -368,7 +386,8 @@ async function saveRule() {
         retest_days_threshold: retestDaysThreshold,
         force_include_stream_ids: JSON.parse(document.getElementById('forceIncludeStreamIds').value || '[]'),
         force_exclude_stream_ids: JSON.parse(document.getElementById('forceExcludeStreamIds').value || '[]'),
-        assigned_profiles: Array.from(document.querySelectorAll('input.profile-checkbox:checked')).map(cb => cb.value)
+        assigned_profiles: Array.from(document.querySelectorAll('input.profile-checkbox:checked')).map(cb => cb.value),
+        override_global_exclusions: Array.from(document.querySelectorAll('input[id^="override_"]:checked')).map(cb => parseInt(cb.value))
     };
     
     console.log('DEBUG: JavaScript saveRule - ruleData to send:', ruleData);
@@ -1215,3 +1234,271 @@ document.addEventListener('DOMContentLoaded', function() {
         confirmBtn.addEventListener('click', addSelectedStreams);
     }
 });
+
+// ============================================================================
+// GLOBAL EXCLUSION PATTERNS FUNCTIONS
+// ============================================================================
+
+async function loadGlobalPatterns() {
+    try {
+        const response = await fetch('/api/global-settings');
+        const data = await response.json();
+        globalPatterns = data.exclusion_patterns || [];
+        displayGlobalPatterns();
+    } catch (error) {
+        console.error('Error loading global patterns:', error);
+    }
+}
+
+function displayGlobalPatterns() {
+    const container = document.getElementById('globalPatternsList');
+    if (!container) return;
+
+    if (globalPatterns.length === 0) {
+        container.innerHTML = '<div class="text-muted text-center py-3"><small>No global exclusion patterns defined</small></div>';
+        return;
+    }
+
+    container.innerHTML = globalPatterns.map(pattern => `
+        <div class="border rounded p-3 mb-2">
+            <div class="d-flex justify-content-between align-items-start">
+                <div class="flex-grow-1">
+                    <div class="d-flex align-items-center mb-2">
+                        <strong>${escapeHtml(pattern.name)}</strong>
+                        <span class="badge ${pattern.enabled ? 'bg-success' : 'bg-secondary'} ms-2">
+                            ${pattern.enabled ? 'Enabled' : 'Disabled'}
+                        </span>
+                    </div>
+                    <code class="d-block mb-2">${escapeHtml(pattern.pattern)}</code>
+                </div>
+                <div class="d-flex gap-1">
+                    <button class="btn btn-sm btn-outline-info" onclick="testPatternById(${pattern.id})" title="Test pattern">
+                        <i class="fas fa-vial"></i>
+                    </button>
+                    <button class="btn btn-sm btn-outline-primary" onclick="editGlobalPattern(${pattern.id})" title="Edit">
+                        <i class="fas fa-edit"></i>
+                    </button>
+                    <button class="btn btn-sm ${pattern.enabled ? 'btn-outline-warning' : 'btn-outline-success'}"
+                            onclick="toggleGlobalPattern(${pattern.id})"
+                            title="${pattern.enabled ? 'Disable' : 'Enable'}">
+                        <i class="fas fa-${pattern.enabled ? 'pause' : 'play'}"></i>
+                    </button>
+                    <button class="btn btn-sm btn-outline-danger" onclick="deleteGlobalPattern(${pattern.id})" title="Delete">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+    `).join('');
+}
+
+function showGlobalPatternModal(patternId = null) {
+    const modal = new bootstrap.Modal(document.getElementById('globalPatternModal'));
+    const title = document.getElementById('globalPatternModalTitle');
+
+    // Reset form
+    document.getElementById('globalPatternId').value = '';
+    document.getElementById('globalPatternName').value = '';
+    document.getElementById('globalPatternRegex').value = '';
+    document.getElementById('globalPatternEnabled').checked = true;
+    document.getElementById('patternTestResults').style.display = 'none';
+
+    if (patternId) {
+        // Edit mode
+        title.textContent = 'Edit Exclusion Pattern';
+        const pattern = globalPatterns.find(p => p.id === patternId);
+        if (pattern) {
+            document.getElementById('globalPatternId').value = pattern.id;
+            document.getElementById('globalPatternName').value = pattern.name;
+            document.getElementById('globalPatternRegex').value = pattern.pattern;
+            document.getElementById('globalPatternEnabled').checked = pattern.enabled;
+        }
+    } else {
+        // Add mode
+        title.textContent = 'Add Exclusion Pattern';
+    }
+
+    modal.show();
+}
+
+function editGlobalPattern(patternId) {
+    showGlobalPatternModal(patternId);
+}
+
+async function saveGlobalPattern() {
+    const patternId = document.getElementById('globalPatternId').value;
+    const name = document.getElementById('globalPatternName').value.trim();
+    const pattern = document.getElementById('globalPatternRegex').value.trim();
+    const enabled = document.getElementById('globalPatternEnabled').checked;
+
+    if (!name || !pattern) {
+        alert('Please provide both name and pattern');
+        return;
+    }
+
+    try {
+        let response;
+        if (patternId) {
+            // Update existing pattern
+            response = await fetch(`/api/global-settings/exclusions/${patternId}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ name, pattern, enabled })
+            });
+        } else {
+            // Create new pattern
+            response = await fetch('/api/global-settings/exclusions', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ name, pattern, enabled })
+            });
+        }
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to save pattern');
+        }
+
+        // Close modal and reload
+        bootstrap.Modal.getInstance(document.getElementById('globalPatternModal')).hide();
+        await loadGlobalPatterns();
+
+        // Show success message
+        showToast(patternId ? 'Pattern updated successfully' : 'Pattern created successfully', 'success');
+    } catch (error) {
+        alert('Error: ' + error.message);
+    }
+}
+
+async function deleteGlobalPattern(patternId) {
+    if (!confirm('Are you sure you want to delete this exclusion pattern?')) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`/api/global-settings/exclusions/${patternId}`, {
+            method: 'DELETE'
+        });
+
+        if (!response.ok) {
+            throw new Error('Failed to delete pattern');
+        }
+
+        await loadGlobalPatterns();
+        showToast('Pattern deleted successfully', 'success');
+    } catch (error) {
+        alert('Error: ' + error.message);
+    }
+}
+
+async function toggleGlobalPattern(patternId) {
+    const pattern = globalPatterns.find(p => p.id === patternId);
+    if (!pattern) return;
+
+    try {
+        const response = await fetch(`/api/global-settings/exclusions/${patternId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ enabled: !pattern.enabled })
+        });
+
+        if (!response.ok) {
+            throw new Error('Failed to toggle pattern');
+        }
+
+        await loadGlobalPatterns();
+        showToast(`Pattern ${!pattern.enabled ? 'enabled' : 'disabled'}`, 'success');
+    } catch (error) {
+        alert('Error: ' + error.message);
+    }
+}
+
+async function testGlobalPattern() {
+    const pattern = document.getElementById('globalPatternRegex').value.trim();
+
+    if (!pattern) {
+        alert('Please enter a pattern to test');
+        return;
+    }
+
+    const resultsDiv = document.getElementById('patternTestResults');
+    resultsDiv.innerHTML = '<div class="text-center"><div class="spinner-border spinner-border-sm"></div> Testing pattern...</div>';
+    resultsDiv.style.display = 'block';
+
+    try {
+        const response = await fetch('/api/global-settings/exclusions/test', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ pattern })
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Test failed');
+        }
+
+        const data = await response.json();
+
+        resultsDiv.innerHTML = `
+            <div class="alert alert-info mb-0">
+                <h6>Test Results</h6>
+                <p class="mb-2">
+                    <strong>${data.matching_count}</strong> of ${data.total_streams} streams would be excluded
+                </p>
+                ${data.matching_count > 0 ? `
+                    <details>
+                        <summary style="cursor: pointer;">View matching streams (first ${Math.min(data.matching_count, 100)})</summary>
+                        <ul class="mt-2 mb-0" style="max-height: 200px; overflow-y: auto;">
+                            ${data.matching_streams.map(s => `<li><small>${escapeHtml(s.name)}</small></li>`).join('')}
+                        </ul>
+                    </details>
+                ` : ''}
+            </div>
+        `;
+    } catch (error) {
+        resultsDiv.innerHTML = `<div class="alert alert-danger mb-0">Error: ${escapeHtml(error.message)}</div>`;
+    }
+}
+
+async function testPatternById(patternId) {
+    const pattern = globalPatterns.find(p => p.id === patternId);
+    if (!pattern) return;
+
+    // Set the pattern in the modal and test it
+    document.getElementById('globalPatternId').value = pattern.id;
+    document.getElementById('globalPatternName').value = pattern.name;
+    document.getElementById('globalPatternRegex').value = pattern.pattern;
+    document.getElementById('globalPatternEnabled').checked = pattern.enabled;
+
+    const modal = new bootstrap.Modal(document.getElementById('globalPatternModal'));
+    modal.show();
+
+    // Run the test after modal shows
+    setTimeout(() => testGlobalPattern(), 300);
+}
+
+function loadGlobalExclusionOverrides() {
+    const container = document.getElementById('overrideCheckboxes');
+    if (!container) return;
+
+    if (globalPatterns.length === 0) {
+        container.innerHTML = '<div class="text-muted text-center py-2"><small>No global exclusion patterns defined</small></div>';
+        return;
+    }
+
+    container.innerHTML = globalPatterns.map(pattern => `
+        <div class="form-check mb-2">
+            <input class="form-check-input" type="checkbox" id="override_${pattern.id}" value="${pattern.id}">
+            <label class="form-check-label" for="override_${pattern.id}">
+                <strong>${escapeHtml(pattern.name)}</strong>
+                <code class="ms-2 text-muted" style="font-size: 0.85em;">${escapeHtml(pattern.pattern)}</code>
+            </label>
+        </div>
+    `).join('');
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}

@@ -2,12 +2,14 @@ from flask import Flask, render_template, request, jsonify, redirect, url_for, f
 import os
 import json
 import time
+import re
 from queue import Queue
 from threading import Thread
 from dotenv import load_dotenv
 from flask_cors import CORS
 from api.dispatcharr_client import DispatcharrClient
-from models import RulesManager, AutoAssignmentRule, StreamMatcher, generate_channel_name_regex
+from models import (RulesManager, AutoAssignmentRule, StreamMatcher, generate_channel_name_regex,
+                    GlobalExclusionPattern, GlobalRuleSettings, GlobalSettingsManager)
 from stream_sorter_models import (
     SortingRulesManager,
     SortingRule,
@@ -23,10 +25,10 @@ load_dotenv()
 APP_VERSION = "v.0.3.3"
 
 # Execution state file
-EXECUTION_STATE_FILE = 'execution_state.json'
+EXECUTION_STATE_FILE = 'rules/execution_state.json'
 
 # M3U refresh state file
-M3U_REFRESH_STATE_FILE = 'm3u_refresh_state.json'
+M3U_REFRESH_STATE_FILE = 'rules/m3u_refresh_state.json'
 
 def load_execution_state():
     """Load execution state from file"""
@@ -44,6 +46,11 @@ def load_execution_state():
 def save_execution_state(state):
     """Save execution state to file"""
     try:
+        # Ensure directory exists
+        directory = os.path.dirname(EXECUTION_STATE_FILE)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+
         with open(EXECUTION_STATE_FILE, 'w') as f:
             json.dump(state, f, indent=2)
     except Exception as e:
@@ -62,6 +69,11 @@ def load_m3u_refresh_state():
 def save_m3u_refresh_state(state):
     """Save M3U refresh state to file"""
     try:
+        # Ensure directory exists
+        directory = os.path.dirname(M3U_REFRESH_STATE_FILE)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+
         with open(M3U_REFRESH_STATE_FILE, 'w') as f:
             json.dump(state, f, indent=2)
     except Exception as e:
@@ -109,16 +121,26 @@ dispatcharr_client = DispatcharrClient(
 )
 
 # Initialize auto-assignment rules manager
-rules_manager = RulesManager()
+rules_manager = RulesManager(rules_file='rules/auto_assignment_rules.json')
+
+# Initialize global settings manager
+global_settings_manager = GlobalSettingsManager(settings_file='rules/global_rule_settings.json')
 
 # Initialize sorting rules manager
-sorting_rules_manager = SortingRulesManager()
+sorting_rules_manager = SortingRulesManager(
+    rules_file='rules/sorting_rules.json',
+    groups_file='rules/channel_groups.json'
+)
 
 # Get cache TTL from environment (default 5 minutes)
 CACHE_TTL = int(os.getenv('CACHE_TTL', '300'))
 
 # Initialize channel groups manager with configurable cache TTL
-channel_groups_manager = ChannelGroupsManager(dispatcharr_client, cache_ttl=CACHE_TTL)
+channel_groups_manager = ChannelGroupsManager(
+    dispatcharr_client,
+    groups_file='rules/channel_groups.json',
+    cache_ttl=CACHE_TTL
+)
 
 # Cache for Dispatcharr statistics to avoid repeated expensive API calls
 _dispatcharr_stats_cache = {
@@ -593,14 +615,17 @@ def api_preview_rule(rule_id):
         
         # Get all streams
         streams = dispatcharr_client.get_streams()
-        
+
         # Get M3U accounts for name mapping
         m3u_accounts = dispatcharr_client.get_m3u_accounts()
         m3u_accounts_dict = {account['id']: account['name'] for account in m3u_accounts}
-        
-        # Preview matches
-        preview = StreamMatcher.preview_matches(rule, streams, m3u_accounts_dict)
-        
+
+        # Load global settings for exclusion patterns
+        global_settings = global_settings_manager.load_settings()
+
+        # Preview matches (with global exclusions applied)
+        preview = StreamMatcher.preview_matches(rule, streams, m3u_accounts_dict, global_settings)
+
         return jsonify(preview)
         
     except Exception as e:
@@ -663,9 +688,12 @@ def api_execute_rule(rule_id):
         # Otherwise, execute synchronously (original behavior)
         # Get all streams
         streams = dispatcharr_client.get_streams()
-        
+
+        # Load global settings for exclusion patterns
+        global_settings = global_settings_manager.load_settings()
+
         # Evaluate rule to get matching streams
-        matching_streams = StreamMatcher.evaluate_rule(rule, streams)
+        matching_streams = StreamMatcher.evaluate_rule(rule, streams, global_settings=global_settings)
         
         # If should replace, first remove existing streams from channel
         if rule.replace_existing_streams:
@@ -1065,9 +1093,12 @@ def execute_auto_assignment_in_background(rule_id, queue):
                 'type': 'matching',
                 'message': 'Finding matching streams with all conditions (including stats)...'
             })
-            
+
+            # Load global settings for exclusion patterns
+            global_settings = global_settings_manager.load_settings()
+
             # Evaluate rule on pre-filtered streams (those that already passed basic conditions)
-            matching_streams = StreamMatcher.evaluate_rule(rule, pre_filtered_streams)
+            matching_streams = StreamMatcher.evaluate_rule(rule, pre_filtered_streams, global_settings=global_settings)
             
             queue.put({
                 'type': 'info',
@@ -1661,6 +1692,140 @@ def api_channel_groups():
         channel_groups_manager.load_groups(force_refresh=True)
         groups = [group.to_dict() for group in channel_groups_manager.groups.values()]
         return jsonify(groups)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# GLOBAL SETTINGS API ENDPOINTS
+# ============================================================================
+
+@app.route('/api/global-settings')
+def get_global_settings():
+    """Get global rule settings including exclusion patterns"""
+    try:
+        settings = global_settings_manager.load_settings()
+        return jsonify(settings.to_dict())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/global-settings/exclusions', methods=['POST'])
+def add_exclusion_pattern():
+    """Add a new global exclusion pattern"""
+    try:
+        data = request.get_json()
+
+        name = data.get('name')
+        pattern = data.get('pattern')
+        enabled = data.get('enabled', True)
+
+        if not name or not pattern:
+            return jsonify({'error': 'Name and pattern are required'}), 400
+
+        # Validate regex pattern
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            return jsonify({'error': f'Invalid regex pattern: {str(e)}'}), 400
+
+        # Add pattern
+        new_pattern = global_settings_manager.add_pattern(name, pattern, enabled)
+
+        return jsonify(new_pattern.to_dict()), 201
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/global-settings/exclusions/<int:pattern_id>', methods=['PUT'])
+def update_exclusion_pattern(pattern_id):
+    """Update an existing global exclusion pattern"""
+    try:
+        data = request.get_json()
+
+        name = data.get('name')
+        pattern = data.get('pattern')
+        enabled = data.get('enabled')
+
+        # Validate regex if provided
+        if pattern:
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                return jsonify({'error': f'Invalid regex pattern: {str(e)}'}), 400
+
+        # Update pattern
+        updated_pattern = global_settings_manager.update_pattern(
+            pattern_id,
+            name=name,
+            pattern_regex=pattern,
+            enabled=enabled
+        )
+
+        if not updated_pattern:
+            return jsonify({'error': 'Pattern not found'}), 404
+
+        return jsonify(updated_pattern.to_dict())
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/global-settings/exclusions/<int:pattern_id>', methods=['DELETE'])
+def delete_exclusion_pattern(pattern_id):
+    """Delete a global exclusion pattern"""
+    try:
+        success = global_settings_manager.delete_pattern(pattern_id)
+
+        if not success:
+            return jsonify({'error': 'Pattern not found'}), 404
+
+        return jsonify({'message': 'Pattern deleted successfully'})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/global-settings/exclusions/test', methods=['POST'])
+def test_exclusion_pattern():
+    """Test a pattern against current streams to see what would be excluded"""
+    try:
+        data = request.get_json()
+        pattern = data.get('pattern')
+
+        if not pattern:
+            return jsonify({'error': 'Pattern is required'}), 400
+
+        # Validate regex
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            return jsonify({'error': f'Invalid regex pattern: {str(e)}'}), 400
+
+        # Get all streams
+        streams = dispatcharr_client.get_streams() or []
+
+        # Find matching streams
+        matching_streams = []
+        for stream in streams:
+            stream_name = stream.get('name', '')
+            try:
+                if re.search(pattern, stream_name, re.IGNORECASE):
+                    matching_streams.append({
+                        'id': stream.get('id'),
+                        'name': stream_name
+                    })
+            except:
+                pass
+
+        return jsonify({
+            'pattern': pattern,
+            'total_streams': len(streams),
+            'matching_count': len(matching_streams),
+            'matching_streams': matching_streams[:100]  # Limit to first 100 for performance
+        })
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

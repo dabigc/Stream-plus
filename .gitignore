@@ -65,6 +65,7 @@ temp/
 # Rules directory (for Docker volumes - do not version production data)
 rules/
 !rules/.gitkeep
+!rules/README.md
 
 # Playwright MCP
 .playwright-mcp/

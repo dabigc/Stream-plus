@@ -64,14 +64,18 @@ docker exec stream-plus python execute_rules.py --all
 
 2. **Data Models** (`models.py`)
    - `AutoAssignmentRule`: Rules for automatically assigning streams to channels
-   - `RulesManager`: Persistence and CRUD operations for assignment rules
+   - `RulesManager`: Persistence and CRUD operations for assignment rules (stores in `rules/auto_assignment_rules.json`)
    - `StreamMatcher`: Evaluation engine for matching streams against rule conditions
+   - `GlobalExclusionPattern`: Regex patterns for excluding streams across all rules
+   - `GlobalSettingsManager`: Manages global exclusion patterns (stores in `rules/global_rule_settings.json`)
    - Supports migration logic from older rule formats (e.g., v0.3.2 → v0.3.3)
 
 3. **Stream Sorter Models** (`stream_sorter_models.py`)
    - `SortingRule`: Rules for scoring and ordering streams within channels
    - `SortingCondition`: Individual scoring conditions (M3U source, bitrate, codec, etc.)
    - `ChannelGroup`: Grouping of channels for easier rule management
+   - `ChannelGroupsManager`: Manages channel groups with caching (stores in `rules/channel_groups.json`)
+   - `SortingRulesManager`: Persistence for sorting rules (stores in `rules/sorting_rules.json`)
    - `StreamSorter`: Scoring engine that evaluates conditions and sorts streams
 
 4. **Dispatcharr Client** (`api/dispatcharr_client.py`)
@@ -91,6 +95,8 @@ docker exec stream-plus python execute_rules.py --all
 1. **Auto-Assignment Flow:**
    - User creates rule with conditions (regex, resolution, codec, bitrate, etc.)
    - Rule optionally tests streams with ffmpeg/ffprobe to get real statistics
+   - **Global exclusion patterns are applied FIRST** (before rule-specific conditions)
+   - Individual rules can selectively override specific global patterns
    - StreamMatcher evaluates streams against all conditions
    - Matching streams are assigned to the specified channel
    - Channel profiles can be enabled/disabled based on match results
@@ -183,12 +189,27 @@ TZ=UTC
 
 ## File Locations
 
-- **Rules persistence:** `auto_assignment_rules.json`, `sorting_rules.json` (in `/app/rules` in Docker)
-- **Channel groups:** `channel_groups.json` (loaded from Dispatcharr API or local file)
-- **M3U refresh state:** `m3u_refresh_state.json` (tracks last refresh timestamp)
-- **Execution state:** `execution_state.json` (tracks background task progress)
+**All configuration and state files are stored in the `rules/` directory for Docker volume persistence.**
+
+Configuration files (persisted in `rules/` directory):
+- **Auto-assignment rules:** `rules/auto_assignment_rules.json`
+- **Sorting rules:** `rules/sorting_rules.json`
+- **Global exclusion patterns:** `rules/global_rule_settings.json` (global regex patterns applied to all rules)
+- **Channel groups:** `rules/channel_groups.json` (loaded from Dispatcharr API or local file)
+- **M3U refresh state:** `rules/m3u_refresh_state.json` (tracks last refresh timestamp)
+- **Execution state:** `rules/execution_state.json` (tracks background task progress)
+
+Application files:
 - **Templates:** `templates/` directory with Jinja2 HTML templates
 - **Static files:** `static/` directory with CSS, JavaScript, and images
+
+**Docker Volume Mounting:**
+The `rules/` directory is mounted as a Docker volume (`./rules:/app/rules`) to persist all configuration across:
+- Container restarts
+- Docker image updates
+- Container rebuilds
+
+To backup your configuration, simply backup the `rules/` directory.
 
 ## Common Patterns
 

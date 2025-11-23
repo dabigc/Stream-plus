@@ -335,8 +335,14 @@ docker build \
 
 ### Data Persistence
 
-Rule files persist in `./rules/` directory:
-- `auto_assignment_rules.json` - Assignment rules
-- `sorting_rules.json` - Sorting rules
+All configuration and state files persist in the `./rules/` directory (mounted as Docker volume):
+- `auto_assignment_rules.json` - Auto-assignment rules configuration
+- `sorting_rules.json` - Stream sorting rules configuration
+- `global_rule_settings.json` - Global exclusion patterns and settings
+- `channel_groups.json` - Channel groups definitions
+- `execution_state.json` - Last execution state tracking
+- `m3u_refresh_state.json` - M3U refresh timestamp tracking
 
-Files are auto-created with empty structure if missing.
+Files are auto-created with empty structure if missing. The `rules/` directory is mounted as a Docker volume to ensure all configuration persists across container restarts, image updates, and rebuilds.
+
+**Backup:** Simply backup the `./rules/` directory to preserve all your configuration.

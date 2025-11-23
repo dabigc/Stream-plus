@@ -158,12 +158,11 @@ class SortingRulesManager:
     
     def _ensure_file_exists(self):
         """Creates the rules file if it doesn't exist"""
-        if not os.path.exists(self.rules_file):
-            with open(self.rules_file, 'w', encoding='utf-8') as f:
-                json.dump([], f)
-    
-    def _ensure_file_exists(self):
-        """Creates the rules file if it doesn't exist"""
+        # Ensure directory exists
+        directory = os.path.dirname(self.rules_file)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+
         if not os.path.exists(self.rules_file):
             with open(self.rules_file, 'w', encoding='utf-8') as f:
                 json.dump([], f)
@@ -732,6 +731,11 @@ class ChannelGroupsManager:
     def save_groups(self) -> None:
         """Save groups to file"""
         try:
+            # Ensure directory exists
+            directory = os.path.dirname(self.groups_file)
+            if directory and not os.path.exists(directory):
+                os.makedirs(directory, exist_ok=True)
+
             data = {
                 'groups': [group.to_dict() for group in self.groups.values()]
             }
