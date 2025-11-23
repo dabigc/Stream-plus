@@ -114,8 +114,68 @@ rules_manager = RulesManager()
 # Initialize sorting rules manager
 sorting_rules_manager = SortingRulesManager()
 
-# Initialize channel groups manager
-channel_groups_manager = ChannelGroupsManager(dispatcharr_client)
+# Get cache TTL from environment (default 5 minutes)
+CACHE_TTL = int(os.getenv('CACHE_TTL', '300'))
+
+# Initialize channel groups manager with configurable cache TTL
+channel_groups_manager = ChannelGroupsManager(dispatcharr_client, cache_ttl=CACHE_TTL)
+
+# Cache for Dispatcharr statistics to avoid repeated expensive API calls
+_dispatcharr_stats_cache = {
+    'data': None,
+    'timestamp': None,
+    'ttl': CACHE_TTL
+}
+
+def get_cached_dispatcharr_stats():
+    """Get Dispatcharr statistics with caching"""
+    from datetime import datetime, timezone
+
+    # Check if cache is valid
+    if _dispatcharr_stats_cache['data'] is not None and _dispatcharr_stats_cache['timestamp'] is not None:
+        age = (datetime.now(timezone.utc) - _dispatcharr_stats_cache['timestamp']).total_seconds()
+        if age < _dispatcharr_stats_cache['ttl']:
+            print(f"Using cached Dispatcharr statistics (age: {age:.1f}s)")
+            return _dispatcharr_stats_cache['data']
+
+    # Cache is invalid, reload stats
+    print("Loading Dispatcharr statistics...")
+    try:
+        channels = dispatcharr_client.get_channels() or []
+        streams = dispatcharr_client.get_streams() or []
+    except Exception as e:
+        print(f"Error loading Dispatcharr statistics: {e}")
+        channels = []
+        streams = []
+
+    # Calculate statistics
+    total_channels = len(channels)
+    total_streams = len(streams)
+
+    # Count streams associated with channels (streams referenced in channels)
+    channel_stream_ids = set()
+    for channel in channels:
+        if 'streams' in channel and channel['streams']:
+            channel_stream_ids.update(channel['streams'])
+
+    streams_with_channels = len(channel_stream_ids)
+
+    # Count groups with channels (from the groups manager)
+    groups_with_channels = len(channel_groups_manager.groups)
+
+    dispatcharr_stats = {
+        'groups_with_channels': groups_with_channels,
+        'total_channels': total_channels,
+        'total_streams': total_streams,
+        'streams_with_channels': streams_with_channels
+    }
+
+    # Update cache
+    _dispatcharr_stats_cache['data'] = dispatcharr_stats
+    _dispatcharr_stats_cache['timestamp'] = datetime.now(timezone.utc)
+
+    print(f"Dispatcharr stats: {dispatcharr_stats}")
+    return dispatcharr_stats
 
 # Dictionary to store progress queues for active executions
 execution_queues = {}
@@ -133,45 +193,10 @@ def index():
             auto_assignment_rules = []
             sorting_rules = []
         
-        # Reload channel groups to ensure they are up to date
-        try:
-            channel_groups_manager.load_groups()
-        except Exception as e:
-            print(f"Error loading channel groups: {e}")
+        # Channel groups are loaded automatically with caching (no need to reload every time)
 
-        # Load Dispatcharr statistics
-        print("Loading Dispatcharr statistics...")
-        try:
-            channels = dispatcharr_client.get_channels() or []
-            streams = dispatcharr_client.get_streams() or []
-        except Exception as e:
-            print(f"Error loading Dispatcharr statistics: {e}")
-            channels = []
-            streams = []
-        
-        # Calculate statistics
-        total_channels = len(channels)
-        total_streams = len(streams)
-        
-        # Count streams associated with channels (streams referenced in channels)
-        channel_stream_ids = set()
-        for channel in channels:
-            if 'streams' in channel and channel['streams']:
-                channel_stream_ids.update(channel['streams'])
-        
-        streams_with_channels = len(channel_stream_ids)
-        
-        # Count groups with channels (from the reloaded groups manager)
-        groups_with_channels = len(channel_groups_manager.groups)
-        
-        dispatcharr_stats = {
-            'groups_with_channels': groups_with_channels,
-            'total_channels': total_channels,
-            'total_streams': total_streams,
-            'streams_with_channels': streams_with_channels
-        }
-        
-        print(f"Dispatcharr stats: {dispatcharr_stats}")
+        # Load Dispatcharr statistics (using cache)
+        dispatcharr_stats = get_cached_dispatcharr_stats()
 
         # Get last M3U refresh time
         try:
@@ -262,10 +287,9 @@ def auto_assign():
         channels = dispatcharr_client.get_channels()
         m3u_accounts = dispatcharr_client.get_m3u_accounts()
         logos = dispatcharr_client.get_logos()
-        
-        # Reload channel groups to ensure they are up to date
-        channel_groups_manager.load_groups()
-        
+
+        # Channel groups are loaded automatically with caching (no need to reload every time)
+
         # Create channels dictionary by ID for easy access
         channels_dict = {channel['id']: channel for channel in channels}
         
@@ -1489,10 +1513,9 @@ def stream_sorter():
         channels = dispatcharr_client.get_channels()
         sorting_rules = sorting_rules_manager.load_rules()
         m3u_accounts = dispatcharr_client.get_m3u_accounts()
-        
-        # Reload channel groups to ensure they are up to date
-        channel_groups_manager.load_groups()
-        
+
+        # Channel groups are loaded automatically with caching (no need to reload every time)
+
         channel_groups = [group.to_dict() for group in channel_groups_manager.groups.values()]
         print(f"Passing to template: {len(channels)} channels, {len(channel_groups)} groups")
         print(f"Channel groups data: {channel_groups}")
@@ -1634,8 +1657,8 @@ def api_sorting_rule(rule_id):
 def api_channel_groups():
     """API endpoint to get updated channel groups"""
     try:
-        # Force reload groups from API
-        channel_groups_manager.load_groups()
+        # Force reload groups from API (bypass cache)
+        channel_groups_manager.load_groups(force_refresh=True)
         groups = [group.to_dict() for group in channel_groups_manager.groups.values()]
         return jsonify(groups)
     except Exception as e:

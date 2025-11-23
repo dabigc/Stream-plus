@@ -8,6 +8,7 @@ import os
 import re
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, asdict, field
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -577,116 +578,156 @@ class StreamSorter:
 
 class ChannelGroupsManager:
     """Manager for channel groups persistence"""
-    
-    def __init__(self, dispatcharr_client=None, groups_file: str = 'channel_groups.json'):
+
+    def __init__(self, dispatcharr_client=None, groups_file: str = 'channel_groups.json', cache_ttl: int = 300):
         self.groups_file = groups_file
         self.groups: Dict[int, ChannelGroup] = {}
         self.next_id = 1
         self.dispatcharr_client = dispatcharr_client
+        self.cache_ttl = cache_ttl  # Cache time-to-live in seconds (default 5 minutes)
+        self._cache_timestamp = None
+        self._is_loading = False  # Prevent concurrent loads
         self.load_groups()
-    
-    def load_groups(self) -> None:
-        """Load groups from Dispatcharr API or file - optimized to only load groups with channels"""
-        print(f"Loading channel groups efficiently...")
-        
-        # Try to load from Dispatcharr API first
-        if self.dispatcharr_client and hasattr(self.dispatcharr_client, 'get_channels'):
-            try:
-                # Load ALL channels in one request
-                print("Loading all channels to determine active groups...")
-                all_channels = self.dispatcharr_client.get_channels()
-                print(f"Loaded {len(all_channels)} channels from Dispatcharr API")
-                
-                # Group channels by channel_group_id
-                groups_channels = {}
-                for channel in all_channels:
-                    group_id = channel.get('channel_group_id')
-                    if group_id is not None:
-                        if group_id not in groups_channels:
-                            groups_channels[group_id] = []
-                        groups_channels[group_id].append(channel['id'])
-                
-                print(f"Found {len(groups_channels)} groups with channels assigned")
-                
-                # Only load group names for groups that have channels
-                if groups_channels:
-                    try:
-                        api_groups = self.dispatcharr_client.get_channel_groups()
-                        print(f"Loaded {len(api_groups)} group definitions from API")
-                        
-                        # Create groups only for those that have channels
-                        self.groups = {}
-                        for api_group in api_groups:
-                            group_id = api_group['id']
-                            if group_id in groups_channels:  # Only if this group has channels
+
+    def _is_cache_valid(self) -> bool:
+        """Check if cached groups are still valid"""
+        if self._cache_timestamp is None:
+            return False
+
+        from datetime import datetime, timezone, timedelta
+        age = datetime.now(timezone.utc) - self._cache_timestamp
+        return age.total_seconds() < self.cache_ttl
+
+    def load_groups(self, force_refresh: bool = False) -> None:
+        """
+        Load groups from Dispatcharr API or file - optimized to only load groups with channels
+
+        Args:
+            force_refresh: If True, bypass cache and force reload from API
+        """
+        # Return cached data if valid and not forcing refresh
+        if not force_refresh and self._is_cache_valid():
+            print(f"Using cached channel groups (age: {(datetime.now(timezone.utc) - self._cache_timestamp).total_seconds():.1f}s)")
+            return
+
+        # Prevent concurrent loads
+        if self._is_loading:
+            print("Group loading already in progress, skipping...")
+            return
+
+        self._is_loading = True
+        try:
+            print(f"Loading channel groups efficiently...")
+
+            # Try to load from Dispatcharr API first
+            if self.dispatcharr_client and hasattr(self.dispatcharr_client, 'get_channels'):
+                try:
+                    # Load ALL channels in one request
+                    print("Loading all channels to determine active groups...")
+                    all_channels = self.dispatcharr_client.get_channels()
+                    print(f"Loaded {len(all_channels)} channels from Dispatcharr API")
+
+                    # Group channels by channel_group_id
+                    groups_channels = {}
+                    for channel in all_channels:
+                        group_id = channel.get('channel_group_id')
+                        if group_id is not None:
+                            if group_id not in groups_channels:
+                                groups_channels[group_id] = []
+                            groups_channels[group_id].append(channel['id'])
+
+                    print(f"Found {len(groups_channels)} groups with channels assigned")
+
+                    # Only load group names for groups that have channels
+                    if groups_channels:
+                        try:
+                            api_groups = self.dispatcharr_client.get_channel_groups()
+                            print(f"Loaded {len(api_groups)} group definitions from API")
+
+                            # Create groups only for those that have channels
+                            self.groups = {}
+                            for api_group in api_groups:
+                                group_id = api_group['id']
+                                if group_id in groups_channels:  # Only if this group has channels
+                                    group = ChannelGroup(
+                                        id=group_id,
+                                        name=api_group['name'],
+                                        channel_ids=groups_channels[group_id],
+                                        description=f"Group from Dispatcharr API ({len(groups_channels[group_id])} channels)"
+                                    )
+                                    self.groups[group.id] = group
+                                    print(f"Group '{api_group['name']}' (ID: {group_id}) has {len(groups_channels[group_id])} channels")
+                                    if group.id >= self.next_id:
+                                        self.next_id = group.id + 1
+
+                            print(f"Total active groups loaded from API: {len(self.groups)}")
+                            # Update cache timestamp
+                            self._cache_timestamp = datetime.now(timezone.utc)
+                            return
+
+                        except Exception as e:
+                            print(f"Error loading group names from Dispatcharr API: {e}")
+                            # Fallback: create groups with generic names but correct channel assignments
+                            self.groups = {}
+                            for group_id, channel_ids in groups_channels.items():
                                 group = ChannelGroup(
                                     id=group_id,
-                                    name=api_group['name'],
-                                    channel_ids=groups_channels[group_id],
-                                    description=f"Group from Dispatcharr API ({len(groups_channels[group_id])} channels)"
+                                    name=f"Group {group_id}",
+                                    channel_ids=channel_ids,
+                                    description=f"Auto-detected group ({len(channel_ids)} channels)"
                                 )
                                 self.groups[group.id] = group
-                                print(f"Group '{api_group['name']}' (ID: {group_id}) has {len(groups_channels[group_id])} channels")
+                                print(f"Auto-detected group {group_id} with {len(channel_ids)} channels")
                                 if group.id >= self.next_id:
                                     self.next_id = group.id + 1
-                        
-                        print(f"Total active groups loaded from API: {len(self.groups)}")
-                        return
-                        
-                    except Exception as e:
-                        print(f"Error loading group names from Dispatcharr API: {e}")
-                        # Fallback: create groups with generic names but correct channel assignments
+
+                            print(f"Total auto-detected groups: {len(self.groups)}")
+                            # Update cache timestamp
+                            self._cache_timestamp = datetime.now(timezone.utc)
+                            return
+
+                    else:
+                        print("No groups with channels found")
                         self.groups = {}
-                        for group_id, channel_ids in groups_channels.items():
-                            group = ChannelGroup(
-                                id=group_id,
-                                name=f"Group {group_id}",
-                                channel_ids=channel_ids,
-                                description=f"Auto-detected group ({len(channel_ids)} channels)"
-                            )
+                        # Update cache timestamp
+                        self._cache_timestamp = datetime.now(timezone.utc)
+                        return
+
+                except Exception as e:
+                    print(f"Error loading channels/groups from Dispatcharr API: {e}")
+                    print("Falling back to local file...")
+            else:
+                print("Dispatcharr client not available or invalid, loading from local file...")
+
+            # Fallback to local file
+            print(f"Loading groups from: {self.groups_file}")
+            print(f"File exists: {os.path.exists(self.groups_file)}")
+            if os.path.exists(self.groups_file):
+                try:
+                    with open(self.groups_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        print(f"Loaded data: {data}")
+                        self.groups = {}
+                        for group_data in data.get('groups', []):
+                            group = ChannelGroup.from_dict(group_data)
                             self.groups[group.id] = group
-                            print(f"Auto-detected group {group_id} with {len(channel_ids)} channels")
+                            print(f"Loaded group: {group.name} (ID: {group.id})")
                             if group.id >= self.next_id:
                                 self.next_id = group.id + 1
-                        
-                        print(f"Total auto-detected groups: {len(self.groups)}")
-                        return
-                
-                else:
-                    print("No groups with channels found")
+                        print(f"Total groups loaded: {len(self.groups)}")
+                except Exception as e:
+                    print(f"Error loading channel groups: {e}")
+                    import traceback
+                    traceback.print_exc()
                     self.groups = {}
-                    return
-                    
-            except Exception as e:
-                print(f"Error loading channels/groups from Dispatcharr API: {e}")
-                print("Falling back to local file...")
-        else:
-            print("Dispatcharr client not available or invalid, loading from local file...")
-        
-        # Fallback to local file
-        print(f"Loading groups from: {self.groups_file}")
-        print(f"File exists: {os.path.exists(self.groups_file)}")
-        if os.path.exists(self.groups_file):
-            try:
-                with open(self.groups_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    print(f"Loaded data: {data}")
-                    self.groups = {}
-                    for group_data in data.get('groups', []):
-                        group = ChannelGroup.from_dict(group_data)
-                        self.groups[group.id] = group
-                        print(f"Loaded group: {group.name} (ID: {group.id})")
-                        if group.id >= self.next_id:
-                            self.next_id = group.id + 1
-                    print(f"Total groups loaded: {len(self.groups)}")
-            except Exception as e:
-                print(f"Error loading channel groups: {e}")
-                import traceback
-                traceback.print_exc()
+            else:
+                print("Groups file does not exist")
                 self.groups = {}
-        else:
-            print("Groups file does not exist")
-            self.groups = {}
+
+            # Update cache timestamp after any load path
+            self._cache_timestamp = datetime.now(timezone.utc)
+        finally:
+            self._is_loading = False
     
     def save_groups(self) -> None:
         """Save groups to file"""
